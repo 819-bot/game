@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>星際獵人：修正版</title>
+    <style>
+        body { margin: 0; background: #0a0a0a; color: white; font-family: 'Segoe UI', sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; overflow: hidden; }
+        #game-container { position: relative; border: 3px solid #333; }
+        canvas { background: #000; display: block; }
+        
+        .hud { position: absolute; top: 10px; left: 10px; right: 10px; pointer-events: none; display: flex; justify-content: space-between; z-index: 10; }
+        .hp-bar-bg { width: 120px; height: 12px; background: #444; border: 1px solid #fff; margin-top: 5px; }
+        .hp-bar-fill { width: 100%; height: 100%; background: #00ff00; transition: width 0.3s; }
+        .gold-text { color: #ffd700; font-weight: bold; font-size: 20px; }
+
+        #shop-overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.9);
+            display: none; flex-direction: column; align-items: center; justify-content: center;
+            z-index: 20;
+        }
+        .shop-title { color: #00f2ff; font-size: 32px; margin-bottom: 20px; }
+        .shop-item {
+            width: 80%; background: #222; margin: 8px; padding: 15px;
+            border: 1px solid #444; display: flex; justify-content: space-between; align-items: center;
+            border-radius: 5px; cursor: pointer;
+        }
+        .shop-item:hover { background: #333; border-color: #00f2ff; }
+        .price { color: #ffd700; font-weight: bold; }
+        .next-wave-btn {
+            margin-top: 20px; padding: 12px 40px; background: #0088ff;
+            color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 18px;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="game-container">
+        <div class="hud">
+            <div>
+                <span>HP</span>
+                <div class="hp-bar-bg"><div id="hp-fill" class="hp-bar-fill"></div></div>
+                <div style="margin-top:5px">Wave: <span id="wave-count">1</span></div>
+            </div>
+            <div style="text-align: right;">
+                <div class="gold-text">$ <span id="gold-count">0</span></div>
+                <div style="font-size: 12px;">擊殺目標: <span id="kill-target">0</span></div>
+            </div>
+        </div>
+
+        <div id="shop-overlay">
+            <h1 class="shop-title">波段完成 - 補給站</h1>
+            <div class="gold-text" style="margin-bottom: 20px;">可用資金: $ <span id="shop-gold">0</span></div>
+            
+            <div class="shop-item" onclick="buyItem('repair', 50)">
+                <div><span>快速修理 (恢復 50% HP)</span></div>
+                <div class="price">$50</div>
+            </div>
+            <div class="shop-item" onclick="buyItem('maxHp', 150)">
+                <div><span>強化裝甲 (+25 Max HP)</span></div>
+                <div class="price">$150</div>
+            </div>
+            <div class="shop-item" onclick="buyItem('speed', 100)">
+                <div><span>引擎優化 (+1 移動速度)</span></div>
+                <div class="price">$100</div>
+            </div>
+            <div class="shop-item" onclick="buyItem('fireRate', 200)">
+                <div><span>進彈強化 (提升射速)</span></div>
+                <div class="price">$200</div>
+            </div>
+
+            <button class="next-wave-btn" onclick="startNextWave()">進入下一波戰鬥</button>
+        </div>
+
+        <canvas id="gameCanvas"></canvas>
+    </div>
+
+    <script>
+        const canvas = document.getElementById("gameCanvas");
+        const ctx = canvas.getContext("2d");
+        canvas.width = 450;
+        canvas.height = 600;
+
+        let gold = 0, wave = 1, killsInWave = 0, targetKills = 10;
+        let gameActive = true, inShop = false;
+        const keys = {};
+
+        const player = {
+            x: canvas.width/2 - 20, y: canvas.height - 70, w: 40, h: 40,
+            hp: 100, maxHp: 100, speed: 5,
+            fireDelay: 400, lastShot: 0
+        };
+
+        let bullets = [], enemyBullets = [], enemies = [], items = [];
+
+        window.addEventListener("keydown", e => keys[e.code] = true);
+        window.addEventListener("keyup", e => keys[e.code] = false);
+
+        // 重點修正：敵人產生邏輯
+        function spawnEnemy() {
+            // 如果遊戲結束或是正在商店中，就停止遞迴
+            if (!gameActive || inShop) return;
+
+            enemies.push({
+                x: Math.random() * (canvas.width - 40),
+                y: -50, w: 40, h: 35,
+                speed: (Math.random() * 1.5 + 1) + (wave * 0.2),
+                hp: 10 + (wave * 5),
+                shootInterval: Math.max(800, 2000 - (wave * 100)),
+                lastShot: Date.now()
+            });
+
+            // 每隔一段時間產生下一個敵人
+            let nextSpawnTime = Math.max(400, 1500 - (wave * 100));
+            setTimeout(spawnEnemy, nextSpawnTime);
+        }
+
+        function playerShoot() {
+            const now = Date.now();
+            if (now - player.lastShot < player.fireDelay) return;
+            bullets.push({ x: player.x + player.w/2 - 2, y: player.y, w: 4, h: 15, vy: -8 });
+            player.lastShot = now;
+        }
+
+        function dropItem(x, y) {
+            const rand = Math.random();
+            let type = 'gold', color = '#ffd700', label = '$';
+
+            if (rand < 0.15) { type = 'heal'; color = '#00ff00'; label = 'H'; }
+            else if (rand < 0.25) { type = 'power'; color = '#00f2ff'; label = 'P'; }
+
+            items.push({ x, y, w: 20, h: 20, type, color, label, speed: 2 });
+        }
+
+        function rectIntersect(r1, r2) {
+            return r2.x < r1.x + r1.w && r2.x + r2.w > r1.x && r2.y < r1.y + r1.h && r2.y + r2.h > r1.y;
+        }
+
+        function update() {
+            if (!gameActive || inShop) return;
+
+            if (keys["ArrowLeft"] && player.x > 0) player.x -= player.speed;
+            if (keys["ArrowRight"] && player.x < canvas.width - player.w) player.x += player.speed;
+            if (keys["Space"]) playerShoot();
+
+            bullets.forEach((b, i) => {
+                b.y += b.vy;
+                if (b.y < -20) bullets.splice(i, 1);
+            });
+
+            enemyBullets.forEach((eb, i) => {
+                eb.y += 4;
+                if (rectIntersect(player, eb)) {
+                    player.hp -= 10;
+                    enemyBullets.splice(i, 1);
+                }
+                if (eb.y > canvas.height) enemyBullets.splice(i, 1);
+            });
+
+            enemies.forEach((en, i) => {
+                en.y += en.speed;
+                if (Date.now() - en.lastShot > en.shootInterval) {
+                    enemyBullets.push({ x: en.x + en.w/2, y: en.y + en.h, w: 5, h: 10 });
+                    en.lastShot = Date.now();
+                }
+                if (rectIntersect(player, en)) {
+                    player.hp -= 20;
+                    enemies.splice(i, 1);
+                }
+                bullets.forEach((b, bi) => {
+                    if (rectIntersect(en, b)) {
+                        bullets.splice(bi, 1);
+                        dropItem(en.x, en.y);
+                        enemies.splice(i, 1);
+                        killsInWave++;
+                        if (killsInWave >= targetKills) enterShop();
+                    }
+                });
+                if (en.y > canvas.height) enemies.splice(i, 1);
+            });
+
+            items.forEach((it, i) => {
+                it.y += it.speed;
+                if (rectIntersect(player, it)) {
+                    if (it.type === 'gold') gold += 20;
+                    else if (it.type === 'heal') player.hp = Math.min(player.maxHp, player.hp + 25);
+                    else if (it.type === 'power') player.fireDelay = Math.max(120, player.fireDelay - 30);
+                    items.splice(i, 1);
+                }
+            });
+
+            if (player.hp <= 0) gameActive = false;
+            updateUI();
+        }
+
+        function updateUI() {
+            document.getElementById("gold-count").innerText = gold;
+            document.getElementById("wave-count").innerText = wave;
+            document.getElementById("kill-target").innerText = `${killsInWave} / ${targetKills}`;
+            document.getElementById("hp-fill").style.width = Math.max(0, (player.hp/player.maxHp)*100) + "%";
+        }
+
+        function enterShop() {
+            inShop = true;
+            document.getElementById("shop-overlay").style.display = "flex";
+            document.getElementById("shop-gold").innerText = gold;
+            // 清除殘留物
+            enemies = [];
+            enemyBullets = [];
+            bullets = [];
+        }
+
+        function buyItem(type, price) {
+            if (gold < price) return;
+            if (type === 'repair') player.hp = Math.min(player.maxHp, player.hp + player.maxHp * 0.5);
+            else if (type === 'maxHp') { player.maxHp += 25; player.hp += 25; }
+            else if (type === 'speed') player.speed += 1;
+            else if (type === 'fireRate') player.fireDelay = Math.max(100, player.fireDelay - 40);
+            
+            gold -= price;
+            document.getElementById("shop-gold").innerText = gold;
+            updateUI();
+        }
+
+        // 重點修正：重新啟動敵人循環
+        function startNextWave() {
+            inShop = false;
+            document.getElementById("shop-overlay").style.display = "none";
+            wave++;
+            killsInWave = 0;
+            targetKills += 5;
+            
+            // 關鍵：重新手動啟動敵人產生循環
+            spawnEnemy(); 
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            // 畫玩家
+            ctx.fillStyle = "#00f2ff";
+            ctx.beginPath();
+            ctx.moveTo(player.x + player.w/2, player.y);
+            ctx.lineTo(player.x, player.y + player.h);
+            ctx.lineTo(player.x + player.w, player.y + player.h);
+            ctx.fill();
+
+            // 畫子彈
+            ctx.fillStyle = "white";
+            bullets.forEach(b => ctx.fillRect(b.x, b.y, b.w, b.h));
+            ctx.fillStyle = "#ff4444";
+            enemyBullets.forEach(eb => ctx.fillRect(eb.x, eb.y, eb.w, eb.h));
+
+            // 畫敵人
+            enemies.forEach(en => {
+                ctx.fillStyle = "#ff0044";
+                ctx.fillRect(en.x, en.y, en.w, en.h);
+            });
+
+            // 畫道具
+            items.forEach(it => {
+                ctx.fillStyle = it.color;
+                ctx.beginPath(); ctx.arc(it.x+10, it.y+10, 10, 0, Math.PI*2); ctx.fill();
+                ctx.fillStyle = "black"; ctx.font = "bold 12px Arial";
+                ctx.fillText(it.label, it.x+6, it.y+14);
+            });
+
+            if (!gameActive) {
+                ctx.fillStyle = "rgba(0,0,0,0.8)";
+                ctx.fillRect(0,0,canvas.width, canvas.height);
+                ctx.fillStyle = "white"; ctx.textAlign = "center"; ctx.font = "30px Arial";
+                ctx.fillText("遊戲結束", canvas.width/2, canvas.height/2);
+            }
+        }
+
+        function gameLoop() {
+            update();
+            draw();
+            requestAnimationFrame(gameLoop);
+        }
+
+        // 初始啟動
+        spawnEnemy();
+        gameLoop();
+    </script>
+</body>
+</html>
