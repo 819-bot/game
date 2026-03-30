@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <title>末日回收站：進化屍潮</title>
+    <style>
+        body { margin: 0; background: #1a1a1a; color: white; font-family: sans-serif; overflow: hidden; }
+        canvas { background: #2c3e50; display: block; cursor: crosshair; }
+        
+        #hud {
+            position: absolute; top: 20px; left: 20px;
+            background: rgba(0,0,0,0.7); padding: 15px; border-radius: 10px;
+            border-left: 5px solid #f1c40f; pointer-events: none;
+        }
+
+        #shop-overlay {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(20, 20, 20, 0.95);
+            padding: 30px; border: 3px solid #f1c40f;
+            border-radius: 15px; width: 380px;
+            text-align: center; display: none; 
+            box-shadow: 0 0 50px rgba(0,0,0,0.8);
+            z-index: 100;
+        }
+
+        .upgrade-item {
+            display: flex; justify-content: space-between; align-items: center;
+            margin: 15px 0; background: #333; padding: 12px; border-radius: 8px;
+        }
+
+        button {
+            padding: 10px 15px; cursor: pointer; border: none; border-radius: 5px;
+            background: #27ae60; color: white; font-weight: bold;
+        }
+        button:hover { background: #2ecc71; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        #next-wave-btn {
+            margin-top: 20px; width: 100%; font-size: 1.2em; background: #e67e22; height: 50px;
+        }
+
+        #game-over {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 3em; color: #e74c3c; display: none; text-align: center;
+        }
+
+        .hint { position: absolute; bottom: 20px; left: 20px; color: #888; }
+    </style>
+</head>
+<body>
+
+<div id="hud">
+    <div style="font-size: 22px; color: #f1c40f;">金幣: <span id="gold-val">0</span> | 廢料: <span id="scrap-val">0</span></div>
+    <div style="font-size: 18px; margin: 5px 0;">當前波次: <span id="wave-val">1</span> <small>(強度: +<span id="diff-val">0</span>%)</small></div>
+    <div style="color: #ff4444; font-weight: bold; font-size: 18px;">牆體耐久: <span id="hp-val">100</span>%</div>
+</div>
+
+<div class="hint">控制：[W/S] 移動角色 | [點擊] 射擊 | 目標：阻止殭屍越過左側牆線</div>
+
+<div id="shop-overlay">
+    <h2 style="color: #f1c40f;">波次清空！安全整備</h2>
+    <p id="wave-summary">下一波敵人血量與數量將提升 5%</p>
+    
+    <div class="upgrade-item">
+        <div>牆體加固 (HP/全修)<br><small id="cost-wall-txt">20 金幣</small></div>
+        <button id="up-wall" onclick="upgrade('wall')">升級</button>
+    </div>
+    
+    <div class="upgrade-item">
+        <div>武器膛線 (傷害+30)<br><small id="cost-dmg-txt">30 金幣</small></div>
+        <button id="up-dmg" onclick="upgrade('dmg')">升級</button>
+    </div>
+
+    <div class="upgrade-item">
+        <div>快速換彈 (速度+20%)<br><small id="cost-speed-txt">15 廢料</small></div>
+        <button id="up-speed" onclick="upgrade('speed')">升級</button>
+    </div>
+
+    <button id="next-wave-btn" onclick="startNextWave()">開始下一波</button>
+</div>
+
+<div id="game-over">
+    基地失守！<br>
+    <button onclick="location.reload()" style="font-size: 20px; margin-top: 20px; padding: 10px 30px;">重新開始</button>
+</div>
+
+<canvas id="gameCanvas"></canvas>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+
+// 成長係數設定
+const GROWTH_RATE = 1.05; // 每一波成長 5%
+
+let gameState = "BATTLE"; 
+let isWaveSpawning = false;
+let gold = 0;
+let scrap = 0;
+let wave = 1;
+let wallHp = 100;
+let maxWallHp = 100;
+
+// 玩家設定
+const player = {
+    x: 80,
+    y: canvas.height / 2,
+    size: 40,
+    speed: 7,
+    color: '#3498db'
+};
+
+const keys = {};
+window.addEventListener('keydown', e => keys[e.code] = true);
+window.addEventListener('keyup', e => keys[e.code] = false);
+
+let weaponDamage = 45;
+let fireCooldown = 600;
+let lastFireTime = 0;
+let zombies = [];
+let bullets = [];
+let costs = { wall: 20, dmg: 30, speed: 15 };
+
+// 敵人原型
+const ENEMY_TYPES = {
+    NORMAL: { color: '#44bd32', hp: 100, speed: 1.2, size: 40, gold: 15, scrap: 2 },
+    RUNNER: { color: '#f1c40f', hp: 45, speed: 3.5, size: 32, gold: 12, scrap: 4 },
+    TANK: { color: '#9b59b6', hp: 600, speed: 0.6, size: 75, gold: 100, scrap: 20 }
+};
+
+class Zombie {
+    constructor(waveNum) {
+        // 隨機抽取類型
+        const rand = Math.random();
+        let type = ENEMY_TYPES.NORMAL;
+        if (rand > 0.88) type = ENEMY_TYPES.TANK;
+        else if (rand > 0.65) type = ENEMY_TYPES.RUNNER;
+
+        // 計算成長後的屬性: Base * (1.05 ^ (Wave - 1))
+        const multiplier = Math.pow(GROWTH_RATE, waveNum - 1);
+
+        this.x = canvas.width + 100;
+        this.y = Math.random() * (canvas.height - 200) + 100;
+        this.type = type;
+        this.hp = type.hp * multiplier;
+        this.maxHp = this.hp;
+        this.speed = type.speed * (1 + (waveNum * 0.01)); // 速度每波只增 1%，防止無法反應
+        this.size = type.size;
+        this.color = type.color;
+    }
+    update() {
+        if (this.x > 150) {
+            this.x -= this.speed;
+        } else {
+            wallHp -= 0.25; // 對城牆造成持續傷害
+            if (wallHp <= 0) { wallHp = 0; gameState = "GAMEOVER"; }
+        }
+    }
+    draw() {
+        ctx.fillStyle = this.color;
+        ctx.fillRect(this.x, this.y, this.size, this.size);
+        // 血條外框
+        ctx.fillStyle = "#000";
+        ctx.fillRect(this.x, this.y - 15, this.size, 7);
+        // 血條內色
+        ctx.fillStyle = "#e84118";
+        ctx.fillRect(this.x + 1, this.y - 14, (this.size - 2) * (this.hp / this.maxHp), 5);
+    }
+}
+
+class Bullet {
+    constructor(sx, sy, tx, ty) {
+        this.x = sx;
+        this.y = sy;
+        const angle = Math.atan2(ty - sy, tx - sx);
+        this.vx = Math.cos(angle) * 20;
+        this.vy = Math.sin(angle) * 20;
+    }
+    update() { this.x += this.vx; this.y += this.vy; }
+    draw() {
+        ctx.fillStyle = "#fbc531";
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, 5, 0, Math.PI * 2);
+        ctx.fill();
+    }
+}
+
+function spawnWave(waveNum) {
+    gameState = "BATTLE";
+    isWaveSpawning = true;
+    document.getElementById('shop-overlay').style.display = 'none';
+    
+    // 敵人數量成長公式: 5 * (1.05 ^ (Wave-1)) + (Wave * 2)
+    let enemiesToSpawn = Math.floor(5 * Math.pow(GROWTH_RATE, waveNum - 1)) + (waveNum * 2);
+    let spawnedCount = 0;
+
+    let spawnInterval = setInterval(() => {
+        if (gameState === "GAMEOVER") { clearInterval(spawnInterval); return; }
+        zombies.push(new Zombie(waveNum));
+        spawnedCount++;
+        if (spawnedCount >= enemiesToSpawn) {
+            clearInterval(spawnInterval);
+            isWaveSpawning = false;
+        }
+    }, Math.max(300, 1000 - (waveNum * 30)));
+}
+
+function startNextWave() {
+    wave++;
+    bullets = [];
+    zombies = [];
+    spawnWave(wave);
+}
+
+canvas.addEventListener('mousedown', (e) => {
+    if (gameState !== "BATTLE") return;
+    const now = Date.now();
+    if (now - lastFireTime > fireCooldown) {
+        bullets.push(new Bullet(player.x + 40, player.y + 20, e.clientX, e.clientY));
+        lastFireTime = now;
+    }
+});
+
+function upgrade(type) {
+    if (type === 'wall' && gold >= costs.wall) {
+        gold -= costs.wall;
+        maxWallHp += 60;
+        wallHp = maxWallHp;
+        costs.wall = Math.floor(costs.wall * 1.5);
+    } else if (type === 'dmg' && gold >= costs.dmg) {
+        gold -= costs.dmg;
+        weaponDamage += 35;
+        costs.dmg = Math.floor(costs.dmg * 1.6);
+    } else if (type === 'speed' && scrap >= costs.speed) {
+        scrap -= costs.speed;
+        fireCooldown *= 0.8;
+        costs.speed = Math.floor(costs.speed * 1.8);
+    }
+    updateHUD();
+    checkButtons();
+}
+
+function updateHUD() {
+    document.getElementById('gold-val').innerText = gold;
+    document.getElementById('scrap-val').innerText = scrap;
+    document.getElementById('wave-val').innerText = wave;
+    document.getElementById('hp-val').innerText = Math.ceil((wallHp/maxWallHp)*100);
+    document.getElementById('diff-val').innerText = Math.round((Math.pow(GROWTH_RATE, wave-1)-1)*100);
+    
+    document.getElementById('cost-wall-txt').innerText = costs.wall + " 金幣";
+    document.getElementById('cost-dmg-txt').innerText = costs.dmg + " 金幣";
+    document.getElementById('cost-speed-txt').innerText = costs.speed + " 廢料";
+}
+
+function checkButtons() {
+    document.getElementById('up-wall').disabled = gold < costs.wall;
+    document.getElementById('up-dmg').disabled = gold < costs.dmg;
+    document.getElementById('up-speed').disabled = scrap < costs.speed;
+}
+
+function gameLoop() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // 背景防線
+    ctx.fillStyle = "#34495e";
+    ctx.fillRect(0, 0, 150, canvas.height);
+    ctx.fillStyle = "#95a5a6";
+    ctx.fillRect(140, 0, 10, canvas.height);
+
+    if (gameState === "BATTLE") {
+        // 玩家移動
+        if (keys['KeyW'] && player.y > 0) player.y -= player.speed;
+        if (keys['KeyS'] && player.y < canvas.height - player.size) player.y += player.speed;
+        
+        // 畫玩家
+        ctx.fillStyle = player.color;
+        ctx.fillRect(player.x, player.y, player.size, player.size);
+        ctx.fillStyle = "#2c3e50"; // 槍
+        ctx.fillRect(player.x + 30, player.y + 15, 25, 10);
+
+        // 子彈
+        for (let i = bullets.length - 1; i >= 0; i--) {
+            let b = bullets[i];
+            b.update(); b.draw();
+            for (let j = zombies.length - 1; j >= 0; j--) {
+                let z = zombies[j];
+                if (b.x > z.x && b.x < z.x + z.size && b.y > z.y && b.y < z.y + z.size) {
+                    z.hp -= weaponDamage;
+                    bullets.splice(i, 1);
+                    if (z.hp <= 0) {
+                        gold += z.type.gold;
+                        scrap += z.type.scrap;
+                        zombies.splice(j, 1);
+                    }
+                    break;
+                }
+            }
+            if (b && b.x > canvas.width) bullets.splice(i, 1);
+        }
+
+        // 殭屍
+        zombies.forEach(z => { z.update(); z.draw(); });
+
+        // 結算
+        if (!isWaveSpawning && zombies.length === 0) {
+            gameState = "SHOP";
+            document.getElementById('shop-overlay').style.display = 'block';
+            checkButtons();
+        }
+    } else if (gameState === "GAMEOVER") {
+        document.getElementById('game-over').style.display = 'block';
+    }
+
+    updateHUD();
+    requestAnimationFrame(gameLoop);
+}
+
+// 啟動
+spawnWave(1);
+gameLoop();
+
+</script>
+</body>
+</html>
